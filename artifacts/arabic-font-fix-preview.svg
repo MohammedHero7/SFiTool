@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760">
+  <rect width="1400" height="760" fill="#0a0a0a"/>
+  <rect x="70" y="60" width="1260" height="640" rx="18" fill="#121726" stroke="#2f3755"/>
+  <text x="120" y="125" fill="#cfd8ff" font-size="44" font-family="Arial">Arabic Font Image Fix (Applied)</text>
+  <text x="120" y="168" fill="#aeb8de" font-size="26" font-family="Arial">Before = disconnected spacing, After = connected shaped glyphs.</text>
+
+  <rect x="110" y="210" width="1180" height="120" rx="12" fill="#1a2236"/>
+  <text x="150" y="280" fill="#9bb0ff" font-size="36" font-family="Arial">Before</text>
+  <text x="1240" y="285" fill="#f2f2f2" font-size="70" font-family="Arial" direction="rtl" unicode-bidi="plaintext" letter-spacing="16">ا ل خ ي ا ر ا ت</text>
+
+  <rect x="110" y="360" width="1180" height="120" rx="12" fill="#1a2236"/>
+  <text x="150" y="430" fill="#9bb0ff" font-size="36" font-family="Arial">After</text>
+  <text x="1240" y="435" fill="#ffffff" font-size="70" font-family="Arial" direction="rtl" unicode-bidi="plaintext">ﺍﻟﺨﻴﺎﺭﺍﺕ</text>
+
+  <rect x="110" y="510" width="1180" height="120" rx="12" fill="#1a2236"/>
+  <text x="150" y="580" fill="#9bb0ff" font-size="36" font-family="Arial">More examples</text>
+  <text x="1240" y="565" fill="#ffffff" font-size="54" font-family="Arial" direction="rtl" unicode-bidi="plaintext">ﺍﻟﺘﺨﺼﻴﺺ</text>
+  <text x="1240" y="615" fill="#ffffff" font-size="54" font-family="Arial" direction="rtl" unicode-bidi="plaintext">ﺍﻟﻠﻌﺒﺔ</text>
+</svg>
