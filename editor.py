@@ -11,7 +11,7 @@ Features implemented (core subset requested):
 
 This file implements the GUI and connects to `utils.py` helpers.
 """
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 from PIL import ImageFont, ImageDraw
 import sys
 import os
@@ -20,7 +20,7 @@ import unicodedata
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QWidget, QLabel, QPushButton,
     QHBoxLayout, QVBoxLayout, QSpinBox, QCheckBox, QLineEdit, QComboBox,
-    QMessageBox, QFrame, QGridLayout, QTextEdit, QSizePolicy
+    QMessageBox, QFrame, QGridLayout, QTextEdit, QSizePolicy, QInputDialog
 )
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QAction
 from PyQt6.QtCore import Qt, QSize, QPoint
@@ -57,7 +57,10 @@ class AtlasViewer(QWidget):
         self.cols = 0
         self.rows = 0
         self.padding = 0
-        self.selected = None  # (row, col)
+        self.cell_w = 0  # Default cell width
+        self.cell_h = 0  # Default cell height
+        self.selected = None  # (row, col) primary selection
+        self.selected_cells: List[Tuple[int, int]] = []
         self.overlay_map = {}
         self.scale = 1.0
 
@@ -80,12 +83,34 @@ class AtlasViewer(QWidget):
         self.cols = cols
         self.rows = rows
         self.padding = padding
+        self.cell_w = cell_w
+        self.cell_h = cell_h
 
         # Initialize per-column/row sizes
         self.col_widths = [cell_w] * cols
         self.row_heights = [cell_h] * rows
+        self.selected_cells = [cell for cell in self.selected_cells if 0 <= cell[0] < rows and 0 <= cell[1] < cols]
+        if self.selected and self.selected not in self.selected_cells:
+            self.selected = None
+        if not self.selected_cells and self.selected:
+            self.selected_cells = [self.selected]
+        if self.selected is None and self.selected_cells:
+            self.selected = self.selected_cells[-1]
         self._update_scale()
         self.update()
+
+    def _set_single_selection(self, cell: Tuple[int, int]):
+        self.selected = cell
+        self.selected_cells = [cell]
+
+    def _toggle_selection(self, cell: Tuple[int, int]):
+        if cell in self.selected_cells:
+            self.selected_cells = [selected for selected in self.selected_cells if selected != cell]
+            if self.selected == cell:
+                self.selected = self.selected_cells[-1] if self.selected_cells else None
+        else:
+            self.selected_cells.append(cell)
+            self.selected = cell
 
     def _update_scale(self):
         if not self.atlas_image:
@@ -140,14 +165,16 @@ class AtlasViewer(QWidget):
             painter.drawLine(0, int(y*self.scale), int(self.atlas_image.size[0]*self.scale), int(y*self.scale))
 
         # Selection
-        if self.selected:
-            r, c = self.selected
+        for r, c in self.selected_cells:
             x = sum(self.col_widths[:c]) + self.padding*c
             y = sum(self.row_heights[:r]) + self.padding*r
             w = self.col_widths[c]
             h = self.row_heights[r]
-            painter.fillRect(int(x*self.scale), int(y*self.scale), int(w*self.scale), int(h*self.scale), QColor(255, 200, 0, 60))
-            painter.setPen(QColor(255, 200, 0))
+            is_primary = self.selected == (r, c)
+            fill_color = QColor(255, 200, 0, 60) if is_primary else QColor(80, 170, 255, 55)
+            border_color = QColor(255, 200, 0) if is_primary else QColor(80, 170, 255)
+            painter.fillRect(int(x*self.scale), int(y*self.scale), int(w*self.scale), int(h*self.scale), fill_color)
+            painter.setPen(border_color)
             painter.drawRect(int(x*self.scale), int(y*self.scale), int(w*self.scale), int(h*self.scale))
 
         # Overlays
@@ -213,7 +240,12 @@ class AtlasViewer(QWidget):
                 break
             y_acc += h + self.padding
         if r is not None and c is not None:
-            self.selected = (r, c)
+            clicked_cell = (r, c)
+            ctrl_pressed = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            if ev.button() == Qt.MouseButton.LeftButton and ctrl_pressed:
+                self._toggle_selection(clicked_cell)
+            else:
+                self._set_single_selection(clicked_cell)
             self.update()
 
     def mouseMoveEvent(self, ev):
@@ -263,9 +295,13 @@ class MainWindow(QMainWindow):
         self.cols = 0
         self.rows = 0
         self.padding = 0
+        self.ttf_import_size = 64
         self.overlay_map: Dict[int, int] = {}
         self.glyph_adv_map: Dict[int, int] = {}
-        self._last_selected_idx: Optional[int] = None
+        self.glyph_x_offset_map: Dict[int, int] = {}  # Horizontal offset per glyph
+        self.glyph_y_offset_map: Dict[int, int] = {}  # Vertical offset per glyph
+        self.active_ttf_font_path: Optional[str] = None
+        self._last_selection_signature: Optional[Tuple[Tuple[int, int], ...]] = None
 
         self._init_ui()
 
@@ -353,6 +389,35 @@ class MainWindow(QMainWindow):
         import_btn.clicked.connect(self.import_glyph_to_selected)
         right.addWidget(import_btn)
 
+        choose_font_btn = QPushButton("Choose TTF/OTF Font")
+        choose_font_btn.clicked.connect(self.choose_ttf_font)
+        right.addWidget(choose_font_btn)
+
+        self.selected_font_label = QLabel("Selected TTF/OTF: none")
+        right.addWidget(self.selected_font_label)
+
+        ttf_size_layout = QHBoxLayout()
+        ttf_size_layout.addWidget(QLabel("TTF import size:"))
+        self.ttf_size_spin = QSpinBox()
+        self.ttf_size_spin.setRange(1, 512)
+        self.ttf_size_spin.setValue(self.ttf_import_size)
+        self.ttf_size_spin.setToolTip("Fixed point size used for TTF/OTF imports. Glyphs will not auto-enlarge.")
+        ttf_size_layout.addWidget(self.ttf_size_spin)
+        right.addLayout(ttf_size_layout)
+
+        import_font_btn = QPushButton("Import from Selected TTF/OTF")
+        import_font_btn.clicked.connect(self.import_font_glyph_to_selected)
+        right.addWidget(import_font_btn)
+
+        font_color_layout = QHBoxLayout()
+        font_color_layout.addWidget(QLabel("Font glyph color:"))
+        self.font_color_edit = QLineEdit("#FFFFFFFF")
+        self.font_color_edit.setMaxLength(9)
+        self.font_color_edit.setPlaceholderText("#0000 / #RRGGBB / #RRGGBBAA")
+        self.font_color_edit.setToolTip("Hex color for TTF/OTF import. Supports #RGB, #RGBA, #RRGGBB, #RRGGBBAA.")
+        font_color_layout.addWidget(self.font_color_edit)
+        right.addLayout(font_color_layout)
+
         batch_btn = QPushButton("Batch Replace from Folder")
         batch_btn.clicked.connect(self.batch_replace_from_folder)
         right.addWidget(batch_btn)
@@ -399,6 +464,65 @@ class MainWindow(QMainWindow):
         self.sel_adv_dec_btn.setEnabled(False)
         self.sel_adv_inc_btn.setEnabled(False)
         self.sel_adv_reset_btn.setEnabled(False)
+
+        # Glyph Y offset (vertical shift) adjustment
+        selected_yoffset_layout = QHBoxLayout()
+        selected_yoffset_layout.addWidget(QLabel("Selected glyph Y offset:"))
+        self.sel_yoff_dec_btn = QPushButton("-")
+        self.sel_yoff_dec_btn.setFixedWidth(32)
+        self.sel_yoff_dec_btn.setToolTip("Shift glyph up")
+        self.sel_yoff_dec_btn.clicked.connect(lambda: self.adjust_selected_glyph_y_offset(-1))
+        selected_yoffset_layout.addWidget(self.sel_yoff_dec_btn)
+        self.sel_yoff_spin = QSpinBox()
+        self.sel_yoff_spin.setRange(-128, 128)
+        self.sel_yoff_spin.setValue(0)
+        self.sel_yoff_spin.setSpecialValueText("Default")
+        self.sel_yoff_spin.setToolTip("Per-glyph vertical offset. Positive = shift down, Negative = shift up.")
+        self.sel_yoff_spin.valueChanged.connect(self.set_selected_glyph_y_offset)
+        selected_yoffset_layout.addWidget(self.sel_yoff_spin)
+        self.sel_yoff_inc_btn = QPushButton("+")
+        self.sel_yoff_inc_btn.setFixedWidth(32)
+        self.sel_yoff_inc_btn.setToolTip("Shift glyph down")
+        self.sel_yoff_inc_btn.clicked.connect(lambda: self.adjust_selected_glyph_y_offset(1))
+        selected_yoffset_layout.addWidget(self.sel_yoff_inc_btn)
+        self.sel_yoff_reset_btn = QPushButton("Default")
+        self.sel_yoff_reset_btn.setToolTip("Reset selected glyph Y offset to default")
+        self.sel_yoff_reset_btn.clicked.connect(lambda: self.sel_yoff_spin.setValue(0))
+        selected_yoffset_layout.addWidget(self.sel_yoff_reset_btn)
+        right.addLayout(selected_yoffset_layout)
+        self.sel_yoff_spin.setEnabled(False)
+        self.sel_yoff_dec_btn.setEnabled(False)
+        self.sel_yoff_inc_btn.setEnabled(False)
+        self.sel_yoff_reset_btn.setEnabled(False)
+
+        selected_xoffset_layout = QHBoxLayout()
+        selected_xoffset_layout.addWidget(QLabel("Selected glyph X offset:"))
+        self.sel_xoff_dec_btn = QPushButton("<")
+        self.sel_xoff_dec_btn.setFixedWidth(32)
+        self.sel_xoff_dec_btn.setToolTip("Shift glyph left")
+        self.sel_xoff_dec_btn.clicked.connect(lambda: self.adjust_selected_glyph_x_offset(-1))
+        selected_xoffset_layout.addWidget(self.sel_xoff_dec_btn)
+        self.sel_xoff_spin = QSpinBox()
+        self.sel_xoff_spin.setRange(-128, 128)
+        self.sel_xoff_spin.setValue(0)
+        self.sel_xoff_spin.setSpecialValueText("Default")
+        self.sel_xoff_spin.setToolTip("Per-glyph horizontal offset. Positive = shift right, Negative = shift left.")
+        self.sel_xoff_spin.valueChanged.connect(self.set_selected_glyph_x_offset)
+        selected_xoffset_layout.addWidget(self.sel_xoff_spin)
+        self.sel_xoff_inc_btn = QPushButton(">")
+        self.sel_xoff_inc_btn.setFixedWidth(32)
+        self.sel_xoff_inc_btn.setToolTip("Shift glyph right")
+        self.sel_xoff_inc_btn.clicked.connect(lambda: self.adjust_selected_glyph_x_offset(1))
+        selected_xoffset_layout.addWidget(self.sel_xoff_inc_btn)
+        self.sel_xoff_reset_btn = QPushButton("Default")
+        self.sel_xoff_reset_btn.setToolTip("Reset selected glyph X offset to default")
+        self.sel_xoff_reset_btn.clicked.connect(lambda: self.sel_xoff_spin.setValue(0))
+        selected_xoffset_layout.addWidget(self.sel_xoff_reset_btn)
+        right.addLayout(selected_xoffset_layout)
+        self.sel_xoff_spin.setEnabled(False)
+        self.sel_xoff_dec_btn.setEnabled(False)
+        self.sel_xoff_inc_btn.setEnabled(False)
+        self.sel_xoff_reset_btn.setEnabled(False)
 
         # Preview text
         right.addWidget(QLabel("Preview Text:"))
@@ -460,6 +584,40 @@ class MainWindow(QMainWindow):
                 return ord(raw)
             raise
 
+    def _parse_hex_color_input(self, text: str) -> Tuple[int, int, int, int]:
+        """Parse hex color in #RGB/#RGBA/#RRGGBB/#RRGGBBAA form and return RGBA tuple."""
+        raw = text.strip()
+        if not raw:
+            raw = "#FFFFFFFF"
+
+        if raw.startswith('#'):
+            raw = raw[1:]
+
+        if len(raw) == 3:
+            r = int(raw[0] * 2, 16)
+            g = int(raw[1] * 2, 16)
+            b = int(raw[2] * 2, 16)
+            a = 255
+        elif len(raw) == 4:
+            r = int(raw[0] * 2, 16)
+            g = int(raw[1] * 2, 16)
+            b = int(raw[2] * 2, 16)
+            a = int(raw[3] * 2, 16)
+        elif len(raw) == 6:
+            r = int(raw[0:2], 16)
+            g = int(raw[2:4], 16)
+            b = int(raw[4:6], 16)
+            a = 255
+        elif len(raw) == 8:
+            r = int(raw[0:2], 16)
+            g = int(raw[2:4], 16)
+            b = int(raw[4:6], 16)
+            a = int(raw[6:8], 16)
+        else:
+            raise ValueError("Color must be #RGB, #RGBA, #RRGGBB, or #RRGGBBAA")
+
+        return (r, g, b, a)
+
     def _find_glyph_index_for_codepoint(self, codepoint: int, preferred_idx: Optional[int] = None) -> Optional[int]:
         """Find glyph by exact codepoint first, then Arabic compatibility-normalized match."""
         overlay = self.viewer.overlay_map
@@ -492,6 +650,37 @@ class MainWindow(QMainWindow):
         r, c = sel
         return r * self.viewer.cols + c
 
+    def _selected_indices(self) -> List[int]:
+        selected_cells = self.viewer.selected_cells or ([self.viewer.selected] if self.viewer.selected else [])
+        indices: List[int] = []
+        seen = set()
+        for r, c in selected_cells:
+            if 0 <= r < self.viewer.rows and 0 <= c < self.viewer.cols:
+                idx = r * self.viewer.cols + c
+                if idx not in seen:
+                    seen.add(idx)
+                    indices.append(idx)
+        return indices
+
+    def _cell_origin(self, row: int, col: int) -> Tuple[int, int]:
+        x = sum(self.viewer.col_widths[:col]) + self.viewer.padding * col
+        y = sum(self.viewer.row_heights[:row]) + self.viewer.padding * row
+        return x, y
+
+    def _selection_signature(self) -> Optional[Tuple[Tuple[int, int], ...]]:
+        selected_cells = self.viewer.selected_cells or ([self.viewer.selected] if self.viewer.selected else [])
+        if not selected_cells:
+            return None
+        return tuple(selected_cells)
+
+    def _selection_common_value(self, value_map: Dict[int, int], indices: List[int]) -> int:
+        if not indices:
+            return 0
+        first = value_map.get(indices[0], 0)
+        if all(value_map.get(idx, 0) == first for idx in indices):
+            return first
+        return 0
+
     def _effective_glyph_advance(self, idx: int) -> int:
         adv = self.glyph_adv_map.get(idx, 0)
         if adv <= 0:
@@ -518,16 +707,88 @@ class MainWindow(QMainWindow):
         new_value = max(0, min(512, current + delta))
         self.sel_adv_spin.setValue(new_value)
 
+    def set_selected_glyph_y_offset(self, value: int):
+        indices = self._selected_indices()
+        if not indices:
+            return
+        for idx in indices:
+            if value == 0:
+                self.glyph_y_offset_map.pop(idx, None)
+            else:
+                self.glyph_y_offset_map[idx] = int(value)
+
+    def set_selected_glyph_x_offset(self, value: int):
+        indices = self._selected_indices()
+        if not indices:
+            return
+        for idx in indices:
+            if value == 0:
+                self.glyph_x_offset_map.pop(idx, None)
+            else:
+                self.glyph_x_offset_map[idx] = int(value)
+
+    def _shift_selected_glyphs(self, dx: int = 0, dy: int = 0):
+        indices = self._selected_indices()
+        if not indices:
+            QMessageBox.warning(self, "Warning", "Select a cell first")
+            return
+        if not self.atlas_img:
+            QMessageBox.warning(self, "Warning", "Load an atlas first")
+            return
+
+        atlas = self.atlas_img.copy()
+        for idx in indices:
+            row = idx // self.cols
+            col = idx % self.cols
+            x, y = self._cell_origin(row, col)
+            box = (x, y, x + self.cell_w, y + self.cell_h)
+            cell_img = self.atlas_img.crop(box)
+            shifted = Image.new('RGBA', cell_img.size, (0, 0, 0, 0))
+            shifted.paste(cell_img, (dx, dy))
+            atlas.paste(shifted, (x, y))
+
+            if dx:
+                self.glyph_x_offset_map.pop(idx, None)
+            if dy:
+                self.glyph_y_offset_map.pop(idx, None)
+
+        self.atlas_img = atlas
+        selection = list(self.viewer.selected_cells)
+        primary = self.viewer.selected
+        self.viewer.set_atlas(self.atlas_img, self.cell_w, self.cell_h, self.cols, self.rows, self.padding)
+        self.viewer.selected_cells = [cell for cell in selection if 0 <= cell[0] < self.rows and 0 <= cell[1] < self.cols]
+        self.viewer.selected = primary if primary in self.viewer.selected_cells else (self.viewer.selected_cells[-1] if self.viewer.selected_cells else None)
+        self.viewer.update()
+
+    def adjust_selected_glyph_y_offset(self, delta: int):
+        self._shift_selected_glyphs(dy=delta)
+
+        self.sel_yoff_spin.blockSignals(True)
+        self.sel_yoff_spin.setValue(0)
+        self.sel_yoff_spin.blockSignals(False)
+
+    def adjust_selected_glyph_x_offset(self, delta: int):
+        self._shift_selected_glyphs(dx=delta)
+
+        self.sel_xoff_spin.blockSignals(True)
+        self.sel_xoff_spin.setValue(0)
+        self.sel_xoff_spin.blockSignals(False)
+
     def _update_selected_label(self):
         sel = self.viewer.selected
+        signature = self._selection_signature()
         if sel:
             r, c = sel
             idx = r * self.viewer.cols + c
-            selection_changed = idx != self._last_selected_idx
-            self._last_selected_idx = idx
+            selection_changed = signature != self._last_selection_signature
+            self._last_selection_signature = signature
             u = self.viewer.overlay_map.get(idx)
             ch = chr(u) if u else '-'
-            self.selected_label.setText(f"Selected: {r},{c} (#{idx}) {ch}")
+            selected_count = len(self._selected_indices())
+            if selected_count > 1:
+                self.selected_label.setText(f"Selected: {selected_count} glyphs (primary {r},{c} ##{idx}) {ch}")
+            else:
+                self.selected_label.setText(f"Selected: {r},{c} (#{idx}) {ch}")
             # Only sync when selection changes; avoid timer overwriting user edits.
             if selection_changed:
                 new_text = f"{u:04X}" if u is not None else ""
@@ -541,10 +802,25 @@ class MainWindow(QMainWindow):
             self.sel_adv_dec_btn.setEnabled(True)
             self.sel_adv_inc_btn.setEnabled(True)
             self.sel_adv_reset_btn.setEnabled(True)
+            # Sync Y offset controls
+            self.sel_yoff_spin.blockSignals(True)
+            self.sel_yoff_spin.setValue(self._selection_common_value(self.glyph_y_offset_map, self._selected_indices()))
+            self.sel_yoff_spin.blockSignals(False)
+            self.sel_yoff_spin.setEnabled(True)
+            self.sel_yoff_dec_btn.setEnabled(True)
+            self.sel_yoff_inc_btn.setEnabled(True)
+            self.sel_yoff_reset_btn.setEnabled(True)
+            self.sel_xoff_spin.blockSignals(True)
+            self.sel_xoff_spin.setValue(self._selection_common_value(self.glyph_x_offset_map, self._selected_indices()))
+            self.sel_xoff_spin.blockSignals(False)
+            self.sel_xoff_spin.setEnabled(True)
+            self.sel_xoff_dec_btn.setEnabled(True)
+            self.sel_xoff_inc_btn.setEnabled(True)
+            self.sel_xoff_reset_btn.setEnabled(True)
         else:
             self.selected_label.setText("Selected: -")
-            selection_cleared = self._last_selected_idx is not None
-            self._last_selected_idx = None
+            selection_cleared = self._last_selection_signature is not None
+            self._last_selection_signature = None
             if selection_cleared and self.unicode_edit.text():
                 self.unicode_edit.clear()
                 self.unicode_edit.setModified(False)
@@ -555,6 +831,21 @@ class MainWindow(QMainWindow):
             self.sel_adv_dec_btn.setEnabled(False)
             self.sel_adv_inc_btn.setEnabled(False)
             self.sel_adv_reset_btn.setEnabled(False)
+            # Disable Y offset controls
+            self.sel_yoff_spin.blockSignals(True)
+            self.sel_yoff_spin.setValue(0)
+            self.sel_yoff_spin.blockSignals(False)
+            self.sel_yoff_spin.setEnabled(False)
+            self.sel_yoff_dec_btn.setEnabled(False)
+            self.sel_yoff_inc_btn.setEnabled(False)
+            self.sel_yoff_reset_btn.setEnabled(False)
+            self.sel_xoff_spin.blockSignals(True)
+            self.sel_xoff_spin.setValue(0)
+            self.sel_xoff_spin.blockSignals(False)
+            self.sel_xoff_spin.setEnabled(False)
+            self.sel_xoff_dec_btn.setEnabled(False)
+            self.sel_xoff_inc_btn.setEnabled(False)
+            self.sel_xoff_reset_btn.setEnabled(False)
 
     def update_selected_unicode(self):
         """Update the unicode value for the currently selected cell."""
@@ -739,6 +1030,8 @@ class MainWindow(QMainWindow):
             total = cols * rows
             self.overlay_map = {i: u for i, u in self.overlay_map.items() if 0 <= i < total}
         self.glyph_adv_map = {i: a for i, a in self.glyph_adv_map.items() if 0 <= i < cols * rows}
+        self.glyph_x_offset_map = {i: o for i, o in self.glyph_x_offset_map.items() if 0 <= i < cols * rows}
+        self.glyph_y_offset_map = {i: o for i, o in self.glyph_y_offset_map.items() if 0 <= i < cols * rows}
         self.viewer.overlay_map = self.overlay_map
         self.viewer.set_atlas(self.atlas_img, self.cell_w, self.cell_h, cols, rows, self.padding)
         
@@ -784,6 +1077,153 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Imported", "Glyph imported and placed into selected cell")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to import glyph: {e}")
+
+    def _render_font_glyph_to_cell(self, font_path: str, ch: str, color: Tuple[int, int, int, int]) -> Image.Image:
+        """Render a single character from a TTF/OTF file into a transparent cell image."""
+        if not ch:
+            raise ValueError("Character input is empty")
+
+        draw_probe = ImageDraw.Draw(Image.new('L', (1, 1), 0))
+        cell_w = self.cell_w
+        cell_h = self.cell_h
+        requested_size = max(1, int(self.ttf_size_spin.value()))
+
+        def measure(size: int):
+            font = ImageFont.truetype(font_path, size=size)
+            bbox = draw_probe.textbbox((0, 0), ch, font=font)
+            if not bbox:
+                return font, (0, 0, 0, 0), 0, 0
+            bw = max(0, bbox[2] - bbox[0])
+            bh = max(0, bbox[3] - bbox[1])
+            return font, bbox, bw, bh
+
+        font, bbox, bw, bh = measure(requested_size)
+
+        # Keep the requested size as-is whenever it fits; only shrink when necessary.
+        if bw > cell_w or bh > cell_h:
+            lo, hi = 1, requested_size
+            best = None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                f_mid, b_mid, w_mid, h_mid = measure(mid)
+                if w_mid <= cell_w and h_mid <= cell_h and w_mid > 0 and h_mid > 0:
+                    best = (f_mid, b_mid, w_mid, h_mid)
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best is not None:
+                font, bbox, bw, bh = best
+
+        if bw <= 0 or bh <= 0:
+            if requested_size != 1:
+                font, bbox, bw, bh = measure(1)
+            if bw <= 0 or bh <= 0:
+                raise ValueError("Selected font cannot render this character")
+
+        glyph = Image.new('RGBA', (cell_w, cell_h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(glyph)
+
+        # Compensate left/top bearings so the rendered glyph is centered in the cell.
+        draw_x = (cell_w - bw) // 2 - bbox[0]
+        draw_y = (cell_h - bh) // 2 - bbox[1]
+        draw.text((draw_x, draw_y), ch, font=font, fill=color)
+        return glyph
+
+    def choose_ttf_font(self) -> bool:
+        """Choose and cache a TTF/OTF font path for future imports."""
+        font_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select TTF/OTF Font",
+            "",
+            "Font Files (*.ttf *.otf *.ttc);;All Files (*.*)",
+        )
+        if not font_path:
+            return False
+
+        self.active_ttf_font_path = font_path
+        self.selected_font_label.setText(f"Selected TTF/OTF: {os.path.basename(font_path)}")
+        self.selected_font_label.setToolTip(font_path)
+        return True
+
+    def import_font_glyph_to_selected(self):
+        sel = self.viewer.selected
+        if not sel:
+            QMessageBox.warning(self, "Warning", "Select a cell first")
+            return
+
+        if not self.atlas_img:
+            QMessageBox.warning(self, "Warning", "Load an atlas first")
+            return
+
+        if not self.active_ttf_font_path:
+            QMessageBox.information(self, "Select Font", "Choose a TTF/OTF font once, then import by unicode.")
+            if not self.choose_ttf_font():
+                return
+
+        font_path = self.active_ttf_font_path
+        if not font_path:
+            return
+
+        idx = self._selected_index()
+        current_u = self.viewer.overlay_map.get(idx) if idx is not None else None
+        default_input = f"{current_u:04X}" if current_u is not None else "0627"
+        user_input, ok = QInputDialog.getText(
+            self,
+            "Arabic Letter / Unicode",
+            "Enter character or unicode (examples: ا or 0627 or U+0627):",
+            text=default_input,
+        )
+        if not ok:
+            return
+
+        raw = user_input.strip()
+        if not raw:
+            QMessageBox.warning(self, "Warning", "Character input is empty")
+            return
+
+        try:
+            codepoint = self._parse_codepoint_input(raw)
+            if codepoint < 0 or codepoint > 0x10FFFF:
+                QMessageBox.warning(self, "Warning", "Unicode codepoint must be between 0 and 0x10FFFF")
+                return
+            ch = chr(codepoint)
+
+            color_text = self.font_color_edit.text().strip()
+            color_rgba = self._parse_hex_color_input(color_text)
+
+            glyph_cell = self._render_font_glyph_to_cell(font_path, ch, color_rgba)
+
+            r, c = sel
+            x = c * (self.cell_w + self.padding)
+            y = r * (self.cell_h + self.padding)
+
+            atlas = self.atlas_img.copy()
+            # Replace entire target cell so previous glyph pixels are fully removed.
+            atlas.paste(glyph_cell, (x, y))
+            self.atlas_img = atlas
+
+            if idx is not None:
+                self.overlay_map[idx] = codepoint
+                self.viewer.overlay_map[idx] = codepoint
+
+            self.apply_grid()
+            self.viewer.selected = sel
+            self._update_selected_label()
+            QMessageBox.information(
+                self,
+                "Imported",
+                f"Imported U+{codepoint:04X} from {os.path.basename(font_path)} into selected cell",
+            )
+        except ValueError:
+            QMessageBox.warning(
+                self,
+                "Warning",
+                f"Invalid input. Character/unicode: '{raw}', color: '{self.font_color_edit.text().strip()}'",
+            )
+        except OSError as e:
+            QMessageBox.critical(self, "Error", f"Failed to load font: {e}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to import font glyph: {e}")
 
     def batch_replace_from_folder(self):
         if not self.atlas_img:
@@ -876,6 +1316,8 @@ class MainWindow(QMainWindow):
                 "width": self.viewer.cell_w,
                 "height": self.viewer.cell_h,
                 "advance": self._effective_glyph_advance(idx),
+                "x_offset": self.glyph_x_offset_map.get(idx, 0),
+                "y_offset": self.glyph_y_offset_map.get(idx, 0),
             }
 
         meta_path = os.path.join(folder, 'atlas_metadata.json')
@@ -930,9 +1372,11 @@ class MainWindow(QMainWindow):
             
             if idx is None:
                 # Character not mapped - add a space/blank
-                imgs.append(Image.new('RGBA', (glyph_advance, self.cell_h), (0, 0, 0, 0)))
+                imgs.append((Image.new('RGBA', (glyph_advance, self.cell_h), (0, 0, 0, 0)), 0, 0))
             else:
                 effective_advance = self._effective_glyph_advance(idx)
+                x_offset = self.glyph_x_offset_map.get(idx, 0)
+                y_offset = self.glyph_y_offset_map.get(idx, 0)
                 # Extract this glyph from atlas
                 r = idx // self.viewer.cols
                 c = idx % self.viewer.cols
@@ -948,23 +1392,25 @@ class MainWindow(QMainWindow):
                     padded = Image.new('RGBA', (effective_advance, self.viewer.cell_h), (0, 0, 0, 0))
                     offset = (effective_advance - glyph.size[0]) // 2
                     padded.paste(glyph, (offset, 0), glyph)
-                    imgs.append(padded)
+                    imgs.append((padded, x_offset, y_offset))
                 else:
-                    imgs.append(glyph)
+                    imgs.append((glyph, x_offset, y_offset))
         
         if not imgs:
             return
         
         # Combine all glyphs horizontally
-        total_w = sum(i.size[0] for i in imgs)
-        max_h = max(i.size[1] for i in imgs) if imgs else self.cell_h
+        total_w = sum(i[0].size[0] for i in imgs)
+        max_h = max(i[0].size[1] for i in imgs) if imgs else self.cell_h
         
         preview_img = Image.new('RGBA', (total_w, max_h), (40, 40, 40, 255))
         x_pos = 0
-        for img in imgs:
-            # Paste each glyph, centered vertically if needed
-            y_offset = (max_h - img.size[1]) // 2
-            preview_img.paste(img, (x_pos, y_offset), img)
+        for img_item in imgs:
+            img, x_off, y_off = img_item
+            # Paste each glyph with per-glyph X/Y offsets inside its advance slot.
+            y_base = (max_h - img.size[1]) // 2
+            y_final = y_base + y_off
+            preview_img.paste(img, (x_pos + x_off, y_final), img)
             x_pos += img.size[0]
         
         # Display preview fitted into a fixed box so control buttons never resize.
