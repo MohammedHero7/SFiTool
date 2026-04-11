@@ -17,6 +17,9 @@ import sys
 import os
 import math
 import unicodedata
+# --- Arabic shaping imports ---
+import arabic_reshaper
+from bidi.algorithm import get_display
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QWidget, QLabel, QPushButton,
     QHBoxLayout, QVBoxLayout, QSpinBox, QCheckBox, QLineEdit, QComboBox,
@@ -148,28 +151,39 @@ class AtlasViewer(QWidget):
             pen.setWidth(1)
             painter.setPen(pen)
 
+            img_w, img_h = self.atlas_image.size
+
             # Vertical lines
             x = 0
             for w in self.col_widths:
-                painter.drawLine(int(x*self.scale), 0, int(x*self.scale), int(self.atlas_image.size[1]*self.scale))
+                painter.drawLine(int(x*self.scale), 0, int(x*self.scale), int(img_h*self.scale))
                 x += w + self.padding
-            # Last line
-            painter.drawLine(int(x*self.scale), 0, int(x*self.scale), int(self.atlas_image.size[1]*self.scale))
+            # Ensure last line is at image edge
+            painter.drawLine(int(img_w*self.scale), 0, int(img_w*self.scale), int(img_h*self.scale))
 
             # Horizontal lines
             y = 0
             for h in self.row_heights:
-                painter.drawLine(0, int(y*self.scale), int(self.atlas_image.size[0]*self.scale), int(y*self.scale))
+                painter.drawLine(0, int(y*self.scale), int(img_w*self.scale), int(y*self.scale))
                 y += h + self.padding
-            # Last line
-            painter.drawLine(0, int(y*self.scale), int(self.atlas_image.size[0]*self.scale), int(y*self.scale))
+            # Ensure last line is at image edge
+            painter.drawLine(0, int(img_h*self.scale), int(img_w*self.scale), int(img_h*self.scale))
 
         # Selection
+        img_w, img_h = self.atlas_image.size if self.atlas_image else (0, 0)
         for r, c in self.selected_cells:
             x = sum(self.col_widths[:c]) + self.padding*c
             y = sum(self.row_heights[:r]) + self.padding*r
-            w = self.col_widths[c]
-            h = self.row_heights[r]
+            # Adjust width for last column
+            if c == len(self.col_widths) - 1:
+                w = img_w - x if img_w - x > 0 else self.col_widths[c]
+            else:
+                w = self.col_widths[c]
+            # Adjust height for last row
+            if r == len(self.row_heights) - 1:
+                h = img_h - y if img_h - y > 0 else self.row_heights[r]
+            else:
+                h = self.row_heights[r]
             is_primary = self.selected == (r, c)
             fill_color = QColor(255, 200, 0, 60) if is_primary else QColor(80, 170, 255, 55)
             border_color = QColor(255, 200, 0) if is_primary else QColor(80, 170, 255)
@@ -182,10 +196,21 @@ class AtlasViewer(QWidget):
         font = QFont()
         font.setPointSize(max(8, int(10*self.scale)))
         painter.setFont(font)
+        img_w, img_h = self.atlas_image.size if self.atlas_image else (0, 0)
         for r in range(self.rows):
             y = sum(self.row_heights[:r]) + self.padding*r
+            # Adjust height for last row
+            if r == self.rows - 1:
+                h = img_h - y if img_h - y > 0 else self.row_heights[r]
+            else:
+                h = self.row_heights[r]
             for c in range(self.cols):
                 x = sum(self.col_widths[:c]) + self.padding*c
+                # Adjust width for last column
+                if c == self.cols - 1:
+                    w = img_w - x if img_w - x > 0 else self.col_widths[c]
+                else:
+                    w = self.col_widths[c]
                 idx = r*self.cols + c
                 u = self.overlay_map.get(idx)
                 if u is not None:
@@ -194,7 +219,11 @@ class AtlasViewer(QWidget):
                     except Exception:
                         ch = ''
                     if ch:
-                        painter.drawText(int((x+4)*self.scale), int((y+14)*self.scale), ch)
+                        # Center the character in the cell
+                        text_rect = painter.fontMetrics().boundingRect(ch)
+                        tx = int(x*self.scale + (w*self.scale - text_rect.width())/2)
+                        ty = int(y*self.scale + (h*self.scale + text_rect.height())/2 - painter.fontMetrics().descent())
+                        painter.drawText(tx, ty, ch)
 
     def mousePressEvent(self, ev):
         if not self.atlas_pixmap or self.scale <= 0:
@@ -224,17 +253,25 @@ class AtlasViewer(QWidget):
                 return
             y += h + self.padding
 
-        # Regular cell selection
+        # Regular cell selection (allow last cell to extend to image edge)
         c = None
         r = None
         x_acc = 0
+        img_w = self.atlas_image.size[0] if self.atlas_image else 0
         for idx, w in enumerate(self.col_widths):
+            # Adjust width for last column
+            if idx == len(self.col_widths) - 1:
+                w = img_w - x_acc if img_w - x_acc > 0 else w
             if x_acc <= pos_x < x_acc + w:
                 c = idx
                 break
             x_acc += w + self.padding
         y_acc = 0
+        img_h = self.atlas_image.size[1] if self.atlas_image else 0
         for idx, h in enumerate(self.row_heights):
+            # Adjust height for last row
+            if idx == len(self.row_heights) - 1:
+                h = img_h - y_acc if img_h - y_acc > 0 else h
             if y_acc <= pos_y < y_acc + h:
                 r = idx
                 break
@@ -283,6 +320,51 @@ class AtlasViewer(QWidget):
 
 # Main Window
 class MainWindow(QMainWindow):
+    def load_unicode_map_from_metadata(self):
+        """Load a JSON metadata file and map unicode values to atlas cells, supporting 'index' field mapping."""
+        fname, _ = QFileDialog.getOpenFileName(self, "Open Metadata JSON", "", "JSON Files (*.json)")
+        if not fname:
+            return
+        import json
+        try:
+            with open(fname, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load metadata file:\n{e}")
+            return
+
+        overlay_map = {}
+        if isinstance(metadata, dict):
+            for k, v in metadata.items():
+                # Try to get codepoint from key or from value
+                try:
+                    if isinstance(v, dict) and 'unicode' in v:
+                        codepoint = int(v['unicode'])
+                    elif isinstance(k, str) and k.startswith('U+'):
+                        codepoint = int(k[2:], 16)
+                    elif isinstance(k, str) and k.isdigit():
+                        codepoint = int(k)
+                    else:
+                        codepoint = ord(k)
+                except Exception:
+                    continue
+                # Map by index if present
+                if isinstance(v, dict) and 'index' in v:
+                    idx = v['index']
+                    overlay_map[idx] = codepoint
+                elif isinstance(v, dict) and 'row' in v and 'col' in v:
+                    idx = v['row'] * self.cols + v['col']
+                    overlay_map[idx] = codepoint
+                elif isinstance(v, (list, tuple)) and len(v) == 2:
+                    idx = v[0] * self.cols + v[1]
+                    overlay_map[idx] = codepoint
+        if not overlay_map:
+            QMessageBox.warning(self, "Warning", "No valid unicode mapping found in metadata (no 'index', 'row'/'col', or [row,col] found).")
+            return
+        self.overlay_map = overlay_map
+        self.viewer.overlay_map = overlay_map.copy()
+        self.viewer.update()
+        QMessageBox.information(self, "Success", f"Loaded {len(overlay_map)} unicode mappings from metadata (by index).")
 
     # Window
     def __init__(self):
@@ -357,16 +439,18 @@ class MainWindow(QMainWindow):
         # Auto-detect and apply buttons
         autodetect_btn = QPushButton("Auto Detect Grid")
         autodetect_btn.clicked.connect(self.auto_detect)
-        load_meta_btn = QPushButton("Load Grid Metadata")
-        load_meta_btn.clicked.connect(self.load_grid_metadata)
         detect_by_count_btn = QPushButton("Detect by Character Count")
         detect_by_count_btn.clicked.connect(self.detect_by_char_count)
         apply_btn = QPushButton("Apply Grid")
         apply_btn.clicked.connect(self.apply_grid)
         right.addWidget(autodetect_btn)
-        right.addWidget(load_meta_btn)
         right.addWidget(detect_by_count_btn)
         right.addWidget(apply_btn)
+
+        # Load unicode map from metadata (replaces grid metadata loader)
+        load_unicode_map_btn = QPushButton("Load Unicode Map from Metadata")
+        load_unicode_map_btn.clicked.connect(self.load_unicode_map_from_metadata)
+        right.addWidget(load_unicode_map_btn)
 
         # Selected cell actions
         self.selected_label = QLabel("Selected: -")
@@ -421,6 +505,11 @@ class MainWindow(QMainWindow):
         batch_btn = QPushButton("Batch Replace from Folder")
         batch_btn.clicked.connect(self.batch_replace_from_folder)
         right.addWidget(batch_btn)
+
+        # Load unicode map from metadata
+        load_unicode_map_btn = QPushButton("Load Unicode Map from Metadata")
+        load_unicode_map_btn.clicked.connect(self.load_unicode_map_from_metadata)
+        right.addWidget(load_unicode_map_btn)
 
         # Glyph advance adjustment
         width_layout = QHBoxLayout()
@@ -933,7 +1022,7 @@ class MainWindow(QMainWindow):
         )
 
     def load_grid_metadata(self):
-        """Load a metadata file manually and apply grid values from it."""
+        """Load a metadata file manually and apply grid values from it. Also map cell index to unicode if present."""
         if not self.atlas_img:
             QMessageBox.warning(self, "Warning", "Load an atlas first")
             return
@@ -975,12 +1064,32 @@ class MainWindow(QMainWindow):
         self.cell_h_spin.setValue(cell_h)
         self.chars_per_col_spin.setValue(max(1, min(256, cols)))
         self.chars_per_row_spin.setValue(max(1, min(256, rows)))
+
+        # If JSON, try to map overlay_map from unicode/index
+        import json
+        overlay_map = {}
+        try:
+            meta = json.loads(text)
+            for k, v in meta.items():
+                idx = v.get("index")
+                u = v.get("unicode")
+                if idx is not None and u is not None:
+                    overlay_map[idx] = u
+        except Exception:
+            overlay_map = {}
+
         self.apply_grid()
+        if overlay_map:
+            self.overlay_map = overlay_map
+            self.viewer.overlay_map = overlay_map
+            self.viewer.update()
+
         QMessageBox.information(
             self,
             "Metadata Loaded",
             f"Applied grid from {os.path.basename(path)}\n"
-            f"Cell: {cell_w}x{cell_h}, Grid: {cols}x{rows}",
+            f"Cell: {cell_w}x{cell_h}, Grid: {cols}x{rows}\n"
+            + (f"Loaded {len(overlay_map)} unicode mappings." if overlay_map else "")
         )
 
     def detect_by_char_count(self):
@@ -1017,8 +1126,15 @@ class MainWindow(QMainWindow):
         w, h = self.atlas_img.size
         
         # Calculate grid dimensions
-        cols = max(1, (w - self.padding) // (self.cell_w + self.padding))
-        rows = max(1, (h - self.padding) // (self.cell_h + self.padding))
+        # Calculate columns: add extra if leftover space
+        col_base = self.cell_w + self.padding
+        row_base = self.cell_h + self.padding
+        cols = max(1, (w - self.padding) // col_base)
+        if (w - self.padding) % col_base > 0:
+            cols += 1
+        rows = max(1, (h - self.padding) // row_base)
+        if (h - self.padding) % row_base > 0:
+            rows += 1
         
         self.cols = cols
         self.rows = rows
@@ -1079,9 +1195,16 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to import glyph: {e}")
 
     def _render_font_glyph_to_cell(self, font_path: str, ch: str, color: Tuple[int, int, int, int]) -> Image.Image:
-        """Render a single character from a TTF/OTF file into a transparent cell image."""
+        """Render a single character or shaped word from a TTF/OTF file into a transparent cell image."""
         if not ch:
             raise ValueError("Character input is empty")
+
+        # --- Arabic shaping ---
+        try:
+            reshaped_text = arabic_reshaper.reshape(ch)
+            bidi_text = get_display(reshaped_text)
+        except Exception:
+            bidi_text = ch
 
         draw_probe = ImageDraw.Draw(Image.new('L', (1, 1), 0))
         cell_w = self.cell_w
@@ -1090,7 +1213,7 @@ class MainWindow(QMainWindow):
 
         def measure(size: int):
             font = ImageFont.truetype(font_path, size=size)
-            bbox = draw_probe.textbbox((0, 0), ch, font=font)
+            bbox = draw_probe.textbbox((0, 0), bidi_text, font=font)
             if not bbox:
                 return font, (0, 0, 0, 0), 0, 0
             bw = max(0, bbox[2] - bbox[0])
@@ -1126,7 +1249,7 @@ class MainWindow(QMainWindow):
         # Compensate left/top bearings so the rendered glyph is centered in the cell.
         draw_x = (cell_w - bw) // 2 - bbox[0]
         draw_y = (cell_h - bh) // 2 - bbox[1]
-        draw.text((draw_x, draw_y), ch, font=font, fill=color)
+        draw.text((draw_x, draw_y), bidi_text, font=font, fill=color)
         return glyph
 
     def choose_ttf_font(self) -> bool:
