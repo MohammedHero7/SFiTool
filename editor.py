@@ -1,13 +1,15 @@
 """Font Image Editor - standalone Qt application.
 
 Features implemented (core subset requested):
-- Load a single atlas PNG (Font Atlas) and specify cell size or auto-detect grid
+- Load a single atlas (Font Atlas) and specify cell size or auto-detect grid
 - Visual grid, click cells to select
 - Overlay Unicode character on each cell
-- Import single glyph PNG into a cell (Auto Fit / Center, preserve alpha)
+- Import single glyph into a cell (Auto Fit / Center, preserve alpha)
 - Batch replace glyphs from a folder where filenames are Unicode codepoints (hex)
 - Export modified atlas and JSON metadata (unicode -> cell rect)
 - Padding, glyph width adjustment, RTL/LTR preview, drag & drop
+- Support for multiple image formats: PNG, JPG, BMP, TIFF, DDS, WebP, ICO
+- Export to the same format as imported
 
 This file implements the GUI and connects to `utils.py` helpers.
 """
@@ -42,6 +44,28 @@ except ImportError:
         detect_grid_from_metadata_files, parse_grid_from_metadata_text
     )
 
+# Image format support
+SUPPORTED_FORMATS = {
+    'PNG': ('.png', 'PNG'),
+    'JPEG': ('.jpg', '.jpeg', 'JPEG'),
+    'BMP': ('.bmp', 'BMP'),
+    'TIFF': ('.tiff', '.tif', 'TIFF'),
+    'DDS': ('.dds', 'DDS'),
+    'WebP': ('.webp', 'WEBP'),
+    'ICO': ('.ico', 'ICO'),
+}
+
+SUPPORTED_EXTENSIONS = tuple(ext for exts in [formats[:-1] for formats in SUPPORTED_FORMATS.values()] for ext in exts)
+PIL_FORMATS = {format_name: format_name for format_name in SUPPORTED_FORMATS.keys()}
+
+def get_pil_format_from_extension(file_path: str) -> Optional[str]:
+    """Determine PIL save format from file extension."""
+    ext = os.path.splitext(file_path)[1].lower()
+    for format_name, (_, *exts_and_fmt) in SUPPORTED_FORMATS.items():
+        extensions = exts_and_fmt[:-1]
+        if ext in extensions:
+            return exts_and_fmt[-1]
+    return None
 
 def pil_to_qpixmap(pil_image: Image.Image) -> QPixmap:
     img = pil_image.convert('RGBA')
@@ -132,7 +156,7 @@ class AtlasViewer(QWidget):
         painter.fillRect(self.rect(), QColor(30, 30, 30))
         if not self.atlas_pixmap:
             painter.setPen(QColor(180, 180, 180))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Drop an atlas PNG here or open…")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Drop an atlas image here or open…")
             return
 
         # Draw scaled pixmap
@@ -309,10 +333,10 @@ class AtlasViewer(QWidget):
     def dropEvent(self, ev):
         for url in ev.mimeData().urls():
             path = url.toLocalFile()
-            if path.lower().endswith('.png'):
+            if path.lower().endswith(SUPPORTED_EXTENSIONS):
                 try:
                     img = Image.open(path).convert('RGBA')
-                    self.parent().load_atlas_image(img)
+                    self.parent().load_atlas_image(img, path)
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to open image: {e}")
                 break
@@ -372,6 +396,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Font Image Editor")
         self.atlas_img: Optional[Image.Image] = None
         self.atlas_path: Optional[str] = None
+        self.atlas_format: Optional[str] = None  # Track original format
         self.cell_w = 72
         self.cell_h = 72
         self.cols = 0
@@ -978,21 +1003,30 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", f"Error: {e}")
 
     def open_atlas(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open Atlas PNG", "", "PNG Files (*.png);;All Images (*.*)")
+        # Build filter string for all supported formats
+        filter_parts = []
+        for fmt_name, (ext, *_) in SUPPORTED_FORMATS.items():
+            filter_parts.append(f"{fmt_name} Files (*{ext})")
+        filter_parts.append("All Files (*.*)")
+        filter_str = ";;".join(filter_parts)
+        
+        path, _ = QFileDialog.getOpenFileName(self, "Open Atlas Image", "", filter_str)
         if not path:
             return
         try:
             img = Image.open(path).convert('RGBA')
             self.atlas_img = img
             self.atlas_path = path
+            self.atlas_format = get_pil_format_from_extension(path)
             # default: use spins values
             self.apply_grid()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open: {e}")
 
-    def load_atlas_image(self, img: Image.Image):
+    def load_atlas_image(self, img: Image.Image, path: Optional[str] = None):
         self.atlas_img = img
-        self.atlas_path = None
+        self.atlas_path = path
+        self.atlas_format = get_pil_format_from_extension(path) if path else 'PNG'
         self.apply_grid()
 
     def auto_detect(self):
@@ -1161,7 +1195,15 @@ class MainWindow(QMainWindow):
         if not sel:
             QMessageBox.warning(self, "Warning", "Select a cell first")
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Import Glyph PNG", "", "PNG Files (*.png);;All Images (*.*)")
+        
+        # Build filter for supported image formats
+        filter_parts = []
+        for fmt_name, (ext, *_) in SUPPORTED_FORMATS.items():
+            filter_parts.append(f"{fmt_name} Files (*{ext})")
+        filter_parts.append("All Files (*.*)")
+        filter_str = ";;".join(filter_parts)
+        
+        path, _ = QFileDialog.getOpenFileName(self, "Import Glyph Image", "", filter_str)
         if not path:
             return
         try:
@@ -1352,13 +1394,14 @@ class MainWindow(QMainWindow):
         if not self.atlas_img:
             QMessageBox.warning(self, "Warning", "Load an atlas first")
             return
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder with PNGs")
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder with Images")
         if not folder:
             return
         replaced = 0
         skipped = 0
         for fn in os.listdir(folder):
-            if not fn.lower().endswith('.png'):
+            # Check if file has a supported image extension
+            if not any(fn.lower().endswith(ext) for exts in SUPPORTED_FORMATS.values() for ext in exts[:-1]):
                 continue
             name = os.path.splitext(fn)[0]
             try:
@@ -1421,8 +1464,18 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select Export Folder")
         if not folder:
             return
-        atlas_path = os.path.join(folder, 'atlas_modified.png')
-        self.atlas_img.save(atlas_path)
+        
+        # Determine export format - use original format if available, otherwise PNG
+        export_format = self.atlas_format or 'PNG'
+        export_ext = SUPPORTED_FORMATS.get(export_format, ('.png', 'PNG'))[0]
+        atlas_filename = f'atlas_modified{export_ext}'
+        atlas_path = os.path.join(folder, atlas_filename)
+        
+        try:
+            self.atlas_img.save(atlas_path, format=export_format)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export atlas: {e}")
+            return
 
         # build metadata: map unicode -> rect
         mapping = {}
@@ -1445,7 +1498,7 @@ class MainWindow(QMainWindow):
 
         meta_path = os.path.join(folder, 'atlas_metadata.json')
         export_metadata_json(mapping, meta_path)
-        QMessageBox.information(self, "Exported", f"Atlas and metadata exported to {folder}")
+        QMessageBox.information(self, "Exported", f"Atlas ({export_format}) and metadata exported to {folder}")
 
     def render_preview(self):
         # Apply pending unicode edit so preview reflects the latest typed hex.
